@@ -145,6 +145,18 @@ class Domain:
         self.valid_tlsrpt = None
         self.tlsrpt_ruas = []
 
+        # DKIM info (RFC 6376).  A mapping of each tested selector to a
+        # dictionary describing the record found (if any) at
+        # <selector>._domainkey.<domain>.  Empty when no selectors were
+        # tested, since DKIM selectors cannot be discovered from DNS.
+        self.dkim_results = {}
+
+        # DNS blocklist (DNSBL) info.  blacklist_results maps each tested
+        # mail server IP address to a mapping of DNSBL zone to listing
+        # status.  dnsbls_checked records which zones were queried.
+        self.blacklist_results = {}
+        self.dnsbls_checked = []
+
         # Syntax validity - default spf to false as the lack of an SPF is a bad thing.
         self.valid_spf = False
         self.valid_dmarc = True
@@ -221,6 +233,49 @@ class Domain:
     def has_tlsrpt(self):
         """Check if this domain publishes an SMTP TLS Reporting (TLS-RPT) record."""
         return self.has_tlsrpt_record
+
+    def dkim_selectors_with_records(self):
+        """Return the list of tested DKIM selectors that had a record."""
+        return [
+            selector
+            for selector, result in self.dkim_results.items()
+            if result["record"]
+        ]
+
+    def has_dkim(self):
+        """Check if any tested DKIM selector returned a record.
+
+        Returns None when no selectors were tested, since DKIM selectors
+        cannot be discovered from DNS and must be supplied by the user.
+        """
+        if not self.dkim_results:
+            return None
+        return len(self.dkim_selectors_with_records()) > 0
+
+    def valid_dkim(self):
+        """Check if every tested DKIM selector that had a record is valid."""
+        selectors = self.dkim_selectors_with_records()
+        if not selectors:
+            return None if not self.dkim_results else False
+        return all(self.dkim_results[selector]["valid"] for selector in selectors)
+
+    def blacklist_listings(self):
+        """Return a list of 'ip on zone' strings for every DNSBL listing."""
+        listings = []
+        for ip_address, zones in self.blacklist_results.items():
+            for zone, listed in zones.items():
+                if listed:
+                    listings.append(f"{ip_address} on {zone}")
+        return listings
+
+    def is_blacklisted(self):
+        """Check if any tested mail server IP is listed on any DNSBL.
+
+        Returns None when no DNSBL scan was performed.
+        """
+        if not self.blacklist_results:
+            return None
+        return len(self.blacklist_listings()) > 0
 
     def add_mx_record(self, record):
         """Add a mail server record for this domain."""
@@ -357,6 +412,9 @@ class Domain:
                 ]
             )
 
+        # The mail server IP addresses that were checked against DNSBLs.
+        dkim_blacklist_ips = list(self.blacklist_results.keys())
+
         results = OrderedDict(
             [
                 ("Domain", self.domain_name),
@@ -426,6 +484,31 @@ class Domain:
                 ("Valid TLS-RPT", self.valid_tlsrpt),
                 ("TLS-RPT Results", self.tlsrpt_record),
                 ("TLS-RPT Report URIs", format_list(self.tlsrpt_ruas)),
+                (
+                    "DKIM Selectors Tested",
+                    format_list(list(self.dkim_results.keys())),
+                ),
+                ("DKIM Record", self.has_dkim()),
+                (
+                    "DKIM Records Present",
+                    format_list(self.dkim_selectors_with_records()),
+                ),
+                ("Valid DKIM", self.valid_dkim()),
+                (
+                    "DKIM Results",
+                    format_list(
+                        [
+                            "{}: {}".format(
+                                selector, self.dkim_results[selector]["record"]
+                            )
+                            for selector in self.dkim_selectors_with_records()
+                        ]
+                    ),
+                ),
+                ("Mail Server IPs Tested", format_list(dkim_blacklist_ips)),
+                ("Blacklists Checked", format_list(self.dnsbls_checked)),
+                ("Blacklisted", self.is_blacklisted()),
+                ("Blacklist Listings", format_list(self.blacklist_listings())),
                 ("Syntax Errors", format_list(self.syntax_errors)),
                 ("Debug Info", format_list(self.debug_info)),
             ]

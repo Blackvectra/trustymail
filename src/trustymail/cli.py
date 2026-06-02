@@ -2,7 +2,7 @@
 
 Usage:
   trustymail (INPUT ...) [options]
-  trustymail (INPUT ...) [--output=OUTFILE] [--timeout=TIMEOUT] [--smtp-timeout=TIMEOUT] [--smtp-localhost=HOSTNAME] [--smtp-ports=PORTS] [--no-smtp-cache] [--mx] [--starttls] [--spf] [--dmarc] [--mta-sts] [--debug] [--json] [--dns=HOSTNAMES] [--psl-filename=FILENAME] [--psl-read-only]
+  trustymail (INPUT ...) [--output=OUTFILE] [--timeout=TIMEOUT] [--smtp-timeout=TIMEOUT] [--smtp-localhost=HOSTNAME] [--smtp-ports=PORTS] [--no-smtp-cache] [--mx] [--starttls] [--spf] [--dmarc] [--mta-sts] [--dkim] [--dkim-selectors=SELECTORS] [--blacklist] [--dnsbl-servers=ZONES] [--debug] [--json] [--dns=HOSTNAMES] [--psl-filename=FILENAME] [--psl-read-only]
   trustymail (-h | --help)
 
 Options:
@@ -24,6 +24,19 @@ Options:
   --spf                       Only check SPF records.
   --dmarc                     Only check DMARC records.
   --mta-sts                   Only check MTA-STS and TLS-RPT records.
+  --dkim                      Only check DKIM records.  Requires
+                              --dkim-selectors.
+  --dkim-selectors=SELECTORS  A comma-delimited list of DKIM selectors to
+                              check (for example 'google,selector1').  DKIM
+                              selectors cannot be discovered from DNS, so
+                              they must be supplied here for DKIM to be
+                              checked.
+  --blacklist                 Check the domain's mail server IP addresses
+                              against DNS blocklists (DNSBLs).  This check is
+                              opt-in and is not part of the default scan.
+  --dnsbl-servers=ZONES       A comma-delimited list of DNSBL zones to query
+                              instead of the built-in defaults (for example
+                              'zen.spamhaus.org,bl.spamcop.net').
   --json                      Output is in JSON format.  (Default is CSV.)
   --debug                     Output should include more verbose logging.
   --dns=HOSTNAMES             A comma-delimited list of DNS servers to query
@@ -115,6 +128,22 @@ def main():
     else:
         dns_hostnames = None
 
+    if args["--dkim-selectors"] is not None:
+        dkim_selectors = [
+            selector.strip()
+            for selector in args["--dkim-selectors"].split(",")
+            if selector.strip()
+        ]
+    else:
+        dkim_selectors = None
+
+    if args["--dnsbl-servers"] is not None:
+        dnsbl_servers = [
+            zone.strip() for zone in args["--dnsbl-servers"].split(",") if zone.strip()
+        ]
+    else:
+        dnsbl_servers = None
+
     # --starttls implies --mx
     if args["--starttls"]:
         args["--mx"] = True
@@ -126,6 +155,8 @@ def main():
         "spf": args["--spf"],
         "dmarc": args["--dmarc"],
         "mta_sts": args["--mta-sts"],
+        "dkim": args["--dkim"],
+        "blacklist": args["--blacklist"],
     }
 
     domain_scans = []
@@ -140,6 +171,8 @@ def main():
                 not args["--no-smtp-cache"],
                 scan_types,
                 dns_hostnames,
+                dkim_selectors,
+                dnsbl_servers,
             )
         )
 

@@ -1,6 +1,7 @@
 """Functions to check a domain's configuration for trustworthy mail."""
 
 # Standard Python Libraries
+import base64
 from collections import OrderedDict
 import csv
 import datetime
@@ -1065,6 +1066,197 @@ def tls_rpt_scan(resolver, domain):
         handle_error("[TLS-RPT]", domain, error)
 
 
+# The DNS blocklists (DNSBLs) queried by default during a blacklist
+# scan.  These are widely used, free-to-query zones.  Note that some
+# providers (notably Spamhaus) return errors or unreliable results when
+# queried from public/cloud resolvers; use --dns to point at a resolver
+# that is permitted to query them.
+DEFAULT_DNSBLS = [
+    "zen.spamhaus.org",
+    "bl.spamcop.net",
+    "b.barracudacentral.org",
+    "dnsbl.sorbs.net",
+]
+
+
+def check_dkim_record(record_text, domain, selector):
+    """Validate the syntax of a single DKIM key record (RFC 6376).
+
+    Parameters
+    ----------
+    record_text : str
+        The text of the DKIM record found in DNS.
+
+    domain : trustymail.Domain
+        The Domain object the record belongs to.  Any errors will be
+        logged to this object.
+
+    selector : str
+        The DKIM selector the record was found under.
+
+    Returns
+    -------
+    bool: True if the record is syntactically valid.
+    """
+    tag_dict = parse_semicolon_tags(record_text)
+    valid = True
+
+    # The version tag is optional, but if present must be DKIM1.
+    if "v" in tag_dict and tag_dict["v"] != "DKIM1":
+        handle_syntax_error(
+            "[DKIM]",
+            domain,
+            f"Selector {selector}: invalid DKIM version {tag_dict['v']}",
+        )
+        valid = False
+
+    # The key type is optional and defaults to rsa.
+    key_type = tag_dict.get("k", "rsa")
+    if key_type not in ("rsa", "ed25519"):
+        handle_syntax_error(
+            "[DKIM]", domain, f"Selector {selector}: unknown DKIM key type {key_type}"
+        )
+        valid = False
+
+    # The public key (p) tag is required.  An empty value means the key
+    # has been revoked (RFC 6376 section 3.6.1).
+    if "p" not in tag_dict:
+        handle_syntax_error(
+            "[DKIM]",
+            domain,
+            f"Selector {selector}: missing required public key (p) tag",
+        )
+        valid = False
+    elif tag_dict["p"] == "":
+        handle_error(
+            "[DKIM]",
+            domain,
+            f"Selector {selector}: public key is empty, indicating the key is revoked",
+        )
+        valid = False
+    else:
+        # The public key must be valid base64.  Any internal whitespace
+        # introduced by TXT record assembly is removed first.
+        public_key = tag_dict["p"].replace(" ", "")
+        try:
+            base64.b64decode(public_key, validate=True)
+        except (ValueError, base64.binascii.Error):
+            handle_syntax_error(
+                "[DKIM]",
+                domain,
+                f"Selector {selector}: public key is not valid base64",
+            )
+            valid = False
+
+    return valid
+
+
+def dkim_scan(resolver, domain, selectors):
+    """Scan a domain for DKIM key records (RFC 6376).
+
+    Because DKIM selectors cannot be discovered from DNS, the caller
+    must supply the selectors to test.  For each selector the record at
+    ``<selector>._domainkey.<domain>`` is fetched and validated.  All
+    results are stored on the Domain object that is passed in.
+
+    Parameters
+    ----------
+    resolver : dns.resolver.Resolver
+        The Resolver object to use for DNS queries.
+
+    domain : trustymail.Domain
+        The Domain object being scanned for DKIM support.  Any errors
+        will be logged to this object.
+
+    selectors : obj:`list` of :obj:`str`
+        The DKIM selectors to test.
+    """
+    for selector in selectors:
+        dkim_domain = "{}._domainkey.{}".format(selector, domain.domain_name)
+        result = {"record": None, "valid": False, "dnssec": None}
+        try:
+            all_records = resolver.query(dkim_domain, "TXT", tcp=True)
+            result["dnssec"] = check_dnssec(domain, dkim_domain, "TXT")
+            # A DKIM record either begins with the version tag or, since
+            # that tag is optional, contains the public key tag.
+            records = [
+                remove_quotes(record.to_text())
+                for record in all_records
+                if remove_quotes(record.to_text()).startswith("v=DKIM1")
+                or "p=" in remove_quotes(record.to_text())
+            ]
+            if records:
+                record_text = records[0]
+                result["record"] = record_text
+                result["valid"] = check_dkim_record(record_text, domain, selector)
+        except (
+            dns.resolver.NoAnswer,
+            dns.resolver.NXDOMAIN,
+            dns.exception.Timeout,
+            dns.resolver.NoNameservers,
+        ) as error:
+            result["dnssec"] = check_dnssec(domain, dkim_domain, "TXT")
+            handle_error("[DKIM]", domain, error)
+        domain.dkim_results[selector] = result
+
+
+def blacklist_scan(resolver, domain, dnsbl_servers):
+    """Scan a domain's mail server IPs against DNS blocklists (DNSBLs).
+
+    Each mail server listed in the domain's MX records is resolved to
+    its IPv4 address(es), and each address is checked against every
+    provided DNSBL zone.  All results are stored on the Domain object
+    that is passed in.
+
+    Parameters
+    ----------
+    resolver : dns.resolver.Resolver
+        The Resolver object to use for DNS queries.
+
+    domain : trustymail.Domain
+        The Domain object being scanned.  Any errors will be logged to
+        this object.
+
+    dnsbl_servers : obj:`list` of :obj:`str`
+        The DNSBL zones to query.
+    """
+    domain.dnsbls_checked = list(dnsbl_servers)
+
+    if not domain.mail_servers:
+        return
+
+    # Resolve the unique IPv4 addresses of the domain's mail servers.
+    ip_addresses = set()
+    for mail_server in domain.mail_servers:
+        try:
+            for record in resolver.query(mail_server, "A", tcp=True):
+                ip_addresses.add(record.to_text())
+        except (
+            dns.resolver.NoAnswer,
+            dns.resolver.NXDOMAIN,
+            dns.exception.Timeout,
+            dns.resolver.NoNameservers,
+        ) as error:
+            handle_error("[BLACKLIST]", domain, error)
+
+    for ip_address in sorted(ip_addresses):
+        domain.blacklist_results[ip_address] = {}
+        # DNSBLs are queried by reversing the IP's octets and prepending
+        # them to the zone; an answer means the address is listed.
+        reversed_ip = ".".join(reversed(ip_address.split(".")))
+        for zone in dnsbl_servers:
+            query_name = "{}.{}".format(reversed_ip, zone)
+            try:
+                resolver.query(query_name, "A", tcp=True)
+                domain.blacklist_results[ip_address][zone] = True
+            except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                # Not listed - this is the expected, healthy case.
+                domain.blacklist_results[ip_address][zone] = False
+            except (dns.exception.Timeout, dns.resolver.NoNameservers) as error:
+                handle_error("[BLACKLIST]", domain, error)
+                domain.blacklist_results[ip_address][zone] = None
+
+
 def find_host_from_ip(resolver, ip_addr):
     """Find the host name for a given IP address."""
     # Use TCP, since we care about the content and correctness of the records
@@ -1082,6 +1274,8 @@ def scan(
     smtp_cache,
     scan_types,
     dns_hostnames,
+    dkim_selectors=None,
+    dnsbl_servers=None,
 ):
     """Parse a domain's DNS information for mail related records."""
     #
@@ -1161,6 +1355,16 @@ def scan(
         mta_sts_scan(resolver, domain, timeout)
         tls_rpt_scan(resolver, domain)
 
+    if scan_types.get("dkim") and domain.is_live and dkim_selectors:
+        dkim_scan(resolver, domain, dkim_selectors)
+
+    if scan_types.get("blacklist") and domain.is_live:
+        # The blacklist scan operates on the domain's mail server IPs, so
+        # ensure the MX records have been fetched first.
+        if domain.mail_servers is None:
+            mx_scan(resolver, domain)
+        blacklist_scan(resolver, domain, dnsbl_servers or DEFAULT_DNSBLS)
+
     # If the user didn't specify any scans then run a full scan.
     if domain.is_live and not (
         scan_types["mx"]
@@ -1168,6 +1372,8 @@ def scan(
         or scan_types["spf"]
         or scan_types["dmarc"]
         or scan_types.get("mta_sts")
+        or scan_types.get("dkim")
+        or scan_types.get("blacklist")
     ):
         mx_scan(resolver, domain)
         starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache)
@@ -1175,6 +1381,12 @@ def scan(
         dmarc_scan(resolver, domain)
         mta_sts_scan(resolver, domain, timeout)
         tls_rpt_scan(resolver, domain)
+        # DKIM is only checked during a full scan when the user has
+        # supplied selectors, since they cannot be discovered from DNS.
+        # The blacklist scan is intentionally opt-in (via --blacklist)
+        # because some DNSBLs rate-limit or block bulk queries.
+        if dkim_selectors:
+            dkim_scan(resolver, domain, dkim_selectors)
 
     return domain
 

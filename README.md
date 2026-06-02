@@ -11,6 +11,8 @@
 domain's DNS. It also checks the mail servers listed in a domain's MX
 records for STARTTLS support, and evaluates a domain's MTA-STS
 (RFC 8461) and SMTP TLS Reporting (TLS-RPT, RFC 8460) configuration. It
+can optionally check DKIM records (for supplied selectors) and look up
+a domain's mail server IP addresses against DNS blocklists (DNSBLs). It
 saves its results to CSV or JSON.
 
 ## Getting started ##
@@ -79,6 +81,18 @@ output will always be written to disk, defaulting to `results.csv`.
   --spf                       Only check SPF records.
   --dmarc                     Only check DMARC records.
   --mta-sts                   Only check MTA-STS and TLS-RPT records.
+  --dkim                      Only check DKIM records.  Requires
+                              --dkim-selectors.
+  --dkim-selectors=SELECTORS  A comma-delimited list of DKIM selectors to
+                              check (for example 'google,selector1').  DKIM
+                              selectors cannot be discovered from DNS, so
+                              they must be supplied here for DKIM to be
+                              checked.
+  --blacklist                 Check the domain's mail server IP addresses
+                              against DNS blocklists (DNSBLs).  This check is
+                              opt-in and is not part of the default scan.
+  --dnsbl-servers=ZONES       A comma-delimited list of DNSBL zones to query
+                              instead of the built-in defaults.
   --json                      Output is in JSON format.  (Default is CSV.)
   --debug                     Output should include more verbose logging.
   --dns=HOSTNAMES             A comma-delimited list of DNS servers to query
@@ -108,6 +122,11 @@ For a given domain, MX records, SPF records (TXT), DMARC (TXT, at
 `https://mta-sts.<domain>/.well-known/mta-sts.txt`), and TLS-RPT (TXT
 at `_smtp._tls.<domain>`) are checked. Resource records can also be
 checked for DNSSEC if the resolver used is DNSSEC-aware.
+
+Two additional checks are available but not run by default: DKIM
+records (TXT, at `<selector>._domainkey.<domain>`, for selectors
+supplied with `--dkim-selectors`) and DNS blocklist (DNSBL) lookups of
+the domain's mail server IP addresses (enabled with `--blacklist`).
 
 The following values are returned in `results.csv`:
 
@@ -219,6 +238,41 @@ The following values are returned in `results.csv`:
   querying DNS.
 - `TLS-RPT Report URIs` - A list of the `rua` reporting URIs (`mailto:`
   or `https:`) specified by the domain.
+
+### DomainKeys Identified Mail (DKIM) ###
+
+DKIM selectors cannot be discovered from DNS, so they must be supplied
+with `--dkim-selectors`.  Each selector is looked up at
+`<selector>._domainkey.<domain>`.
+
+- `DKIM Selectors Tested` - The list of selectors that were queried.
+- `DKIM Record` - True/False whether or not any tested selector
+  returned a DKIM record.
+- `DKIM Records Present` - The list of tested selectors that returned a
+  record.
+- `Valid DKIM` - Whether every tested selector that returned a record
+  is syntactically correct, per [RFC
+  6376](https://tools.ietf.org/html/rfc6376).  An empty public key
+  (`p=`) is treated as a revoked key and is invalid.
+- `DKIM Results` - The DKIM records that were discovered, prefixed with
+  their selector.
+
+### DNS blocklists (DNSBLs) ###
+
+This check is opt-in via `--blacklist`.  The IPv4 address(es) of the
+domain's mail servers are looked up against each DNSBL zone.
+
+- `Mail Server IPs Tested` - The mail server IP addresses that were
+  checked.
+- `Blacklists Checked` - The DNSBL zones that were queried.
+- `Blacklisted` - True if any tested IP address is listed on any of the
+  queried DNSBLs.
+- `Blacklist Listings` - A list of the `IP on zone` combinations that
+  were found to be listed.
+
+Note that some DNSBL providers (notably Spamhaus) return errors or
+unreliable results when queried from public or cloud resolvers.  Use
+`--dns` to point at a resolver that is permitted to query them.
 
 ### Everything else ###
 

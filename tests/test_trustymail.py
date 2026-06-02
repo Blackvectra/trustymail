@@ -377,6 +377,178 @@ class TestGenerateResults(unittest.TestCase):
         self.assertIsNone(results["MTA-STS Record"])
         self.assertIsNone(results["TLS-RPT Record"])
 
+    def test_dkim_and_blacklist_columns_present(self):
+        """The DKIM and blacklist fields appear in the results."""
+        domain = _make_domain()
+        domain.dkim_results = {
+            "google": {
+                "record": "v=DKIM1; k=rsa; p=MIGf",
+                "valid": True,
+                "dnssec": None,
+            }
+        }
+        domain.dnsbls_checked = ["zen.spamhaus.org"]
+        domain.blacklist_results = {"192.0.2.1": {"zen.spamhaus.org": False}}
+
+        results = domain.generate_results()
+        for key in (
+            "DKIM Selectors Tested",
+            "DKIM Record",
+            "DKIM Records Present",
+            "Valid DKIM",
+            "DKIM Results",
+            "Mail Server IPs Tested",
+            "Blacklists Checked",
+            "Blacklisted",
+            "Blacklist Listings",
+        ):
+            self.assertIn(key, results)
+
+        self.assertEqual(results["DKIM Selectors Tested"], "google")
+        self.assertTrue(results["DKIM Record"])
+        self.assertTrue(results["Valid DKIM"])
+        self.assertEqual(results["DKIM Results"], "google: v=DKIM1; k=rsa; p=MIGf")
+        self.assertEqual(results["Mail Server IPs Tested"], "192.0.2.1")
+        self.assertFalse(results["Blacklisted"])
+
+    def test_dkim_and_blacklist_default_to_none(self):
+        """Unscanned DKIM/blacklist fields default to None."""
+        domain = _make_domain()
+        results = domain.generate_results()
+        self.assertIsNone(results["DKIM Record"])
+        self.assertIsNone(results["Valid DKIM"])
+        self.assertIsNone(results["Blacklisted"])
+
+
+class TestCheckDkimRecord(unittest.TestCase):
+    """Test validation of individual DKIM key records."""
+
+    def setUp(self):
+        """Create a domain to log any errors against."""
+        self.domain = _make_domain()
+
+    def test_valid_rsa_record(self):
+        """A record with a valid base64 RSA key is valid."""
+        # "dGVzdA==" is the base64 encoding of "test".
+        self.assertTrue(
+            trustymail.check_dkim_record(
+                "v=DKIM1; k=rsa; p=dGVzdA==", self.domain, "sel"
+            )
+        )
+
+    def test_missing_public_key_is_invalid(self):
+        """A record without a p tag is invalid."""
+        self.assertFalse(
+            trustymail.check_dkim_record("v=DKIM1; k=rsa", self.domain, "sel")
+        )
+
+    def test_revoked_key_is_invalid(self):
+        """An empty p tag (revoked key) is invalid."""
+        self.assertFalse(
+            trustymail.check_dkim_record("v=DKIM1; k=rsa; p=", self.domain, "sel")
+        )
+
+    def test_unknown_key_type_is_invalid(self):
+        """An unknown key type is invalid."""
+        self.assertFalse(
+            trustymail.check_dkim_record(
+                "v=DKIM1; k=magic; p=dGVzdA==", self.domain, "sel"
+            )
+        )
+
+    def test_bad_version_is_invalid(self):
+        """A non-DKIM1 version tag is invalid."""
+        self.assertFalse(
+            trustymail.check_dkim_record("v=DKIM2; p=dGVzdA==", self.domain, "sel")
+        )
+
+    def test_non_base64_key_is_invalid(self):
+        """A public key that is not valid base64 is invalid."""
+        self.assertFalse(
+            trustymail.check_dkim_record("v=DKIM1; p=not!base64!", self.domain, "sel")
+        )
+
+
+class TestDkimScan(unittest.TestCase):
+    """Test the DKIM DNS scan across selectors."""
+
+    def setUp(self):
+        """Create a domain to scan."""
+        self.domain = _make_domain()
+
+    def _scan(self, resolver, selectors):
+        with mock.patch.object(trustymail, "check_dnssec", return_value=True):
+            trustymail.dkim_scan(resolver, self.domain, selectors)
+
+    def test_selector_with_valid_record(self):
+        """A selector with a valid record is recorded as valid."""
+        resolver = _FakeResolver(
+            {"google._domainkey.example.com": ['"v=DKIM1; k=rsa; p=dGVzdA=="']}
+        )
+        self._scan(resolver, ["google"])
+        self.assertEqual(
+            self.domain.dkim_results["google"]["record"], "v=DKIM1; k=rsa; p=dGVzdA=="
+        )
+        self.assertTrue(self.domain.dkim_results["google"]["valid"])
+        self.assertTrue(self.domain.has_dkim())
+        self.assertTrue(self.domain.valid_dkim())
+
+    def test_absent_selector(self):
+        """A selector with no record yields an empty result."""
+        self._scan(_FakeResolver({}), ["missing"])
+        self.assertIsNone(self.domain.dkim_results["missing"]["record"])
+        self.assertFalse(self.domain.has_dkim())
+
+    def test_mixed_selectors(self):
+        """valid_dkim is False when any present record is invalid."""
+        resolver = _FakeResolver(
+            {
+                "good._domainkey.example.com": ['"v=DKIM1; k=rsa; p=dGVzdA=="'],
+                "bad._domainkey.example.com": ['"v=DKIM1; k=rsa; p="'],
+            }
+        )
+        self._scan(resolver, ["good", "bad"])
+        self.assertTrue(self.domain.has_dkim())
+        self.assertFalse(self.domain.valid_dkim())
+
+
+class TestBlacklistScan(unittest.TestCase):
+    """Test the DNSBL/blacklist scan."""
+
+    def setUp(self):
+        """Create a domain with a known mail server."""
+        self.domain = _make_domain()
+        self.domain.mail_servers = ["mail.example.com"]
+
+    def test_listed_ip_is_flagged(self):
+        """An IP that resolves on a DNSBL zone is flagged as blacklisted."""
+        # mail.example.com -> 192.0.2.1; the reversed IP under the zone
+        # resolves, indicating a listing.
+        resolver = _FakeResolver(
+            {
+                "mail.example.com": ["192.0.2.1"],
+                "1.2.0.192.zen.spamhaus.org": ["127.0.0.2"],
+            }
+        )
+        trustymail.blacklist_scan(resolver, self.domain, ["zen.spamhaus.org"])
+        self.assertTrue(self.domain.is_blacklisted())
+        self.assertIn("192.0.2.1 on zen.spamhaus.org", self.domain.blacklist_listings())
+
+    def test_unlisted_ip_is_clean(self):
+        """An IP not present on any zone is not blacklisted."""
+        resolver = _FakeResolver({"mail.example.com": ["192.0.2.1"]})
+        trustymail.blacklist_scan(resolver, self.domain, ["zen.spamhaus.org"])
+        self.assertFalse(self.domain.is_blacklisted())
+        self.assertEqual(self.domain.dnsbls_checked, ["zen.spamhaus.org"])
+
+    def test_no_mail_servers_records_zones_only(self):
+        """With no mail servers, the zones are recorded but no IPs tested."""
+        self.domain.mail_servers = []
+        trustymail.blacklist_scan(_FakeResolver({}), self.domain, ["zen.spamhaus.org"])
+        self.assertEqual(self.domain.blacklist_results, {})
+        self.assertEqual(self.domain.dnsbls_checked, ["zen.spamhaus.org"])
+        self.assertIsNone(self.domain.is_blacklisted())
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
