@@ -10,7 +10,7 @@ from typing import Dict
 from publicsuffixlist.compat import PublicSuffixList
 from publicsuffixlist.update import updatePSL
 
-from . import PublicSuffixListFilename, PublicSuffixListReadOnly, trustymail
+from . import PublicSuffixListFilename, PublicSuffixListReadOnly
 
 
 def get_psl():
@@ -83,7 +83,11 @@ class Domain:
         if self.base_domain_name != self.domain_name:
             self.is_base_domain = False
             if self.base_domain_name not in Domain.base_domains:
-                # Populate DMARC for parent.
+                # Populate DMARC for parent.  This import is performed
+                # lazily, rather than at module load, to avoid a circular
+                # import between this module and the trustymail module.
+                from . import trustymail
+
                 domain = trustymail.scan(
                     self.base_domain_name,
                     timeout,
