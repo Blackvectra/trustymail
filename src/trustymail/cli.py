@@ -2,7 +2,7 @@
 
 Usage:
   trustymail (INPUT ...) [options]
-  trustymail (INPUT ...) [--output=OUTFILE] [--timeout=TIMEOUT] [--smtp-timeout=TIMEOUT] [--smtp-localhost=HOSTNAME] [--smtp-ports=PORTS] [--no-smtp-cache] [--mx] [--starttls] [--spf] [--dmarc] [--debug] [--json] [--dns=HOSTNAMES] [--psl-filename=FILENAME] [--psl-read-only]
+  trustymail (INPUT ...) [--output=OUTFILE] [--timeout=TIMEOUT] [--smtp-timeout=TIMEOUT] [--smtp-localhost=HOSTNAME] [--smtp-ports=PORTS] [--no-smtp-cache] [--mx] [--starttls] [--spf] [--dmarc] [--mta-sts] [--debug] [--json] [--dns=HOSTNAMES] [--psl-filename=FILENAME] [--psl-read-only]
   trustymail (-h | --help)
 
 Options:
@@ -23,6 +23,7 @@ Options:
                               (Implies --mx.)
   --spf                       Only check SPF records.
   --dmarc                     Only check DMARC records.
+  --mta-sts                   Only check MTA-STS and TLS-RPT records.
   --json                      Output is in JSON format.  (Default is CSV.)
   --debug                     Output should include more verbose logging.
   --dns=HOSTNAMES             A comma-delimited list of DNS servers to query
@@ -124,6 +125,7 @@ def main():
         "starttls": args["--starttls"],
         "spf": args["--spf"],
         "dmarc": args["--dmarc"],
+        "mta_sts": args["--mta-sts"],
     }
 
     domain_scans = []

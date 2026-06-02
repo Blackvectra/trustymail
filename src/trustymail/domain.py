@@ -91,7 +91,13 @@ class Domain:
                     smtp_localhost,
                     smtp_ports,
                     smtp_cache,
-                    {"mx": False, "starttls": False, "spf": False, "dmarc": True},
+                    {
+                        "mx": False,
+                        "starttls": False,
+                        "spf": False,
+                        "dmarc": True,
+                        "mta_sts": False,
+                    },
                     dns_hostnames,
                 )
                 Domain.base_domains[self.base_domain_name] = domain
@@ -115,6 +121,25 @@ class Domain:
         self.dmarc_has_aggregate_uri = False
         self.dmarc_has_forensic_uri = False
         self.dmarc_reports_address_error = False
+
+        # MTA-STS info (RFC 8461).  The "has" and "valid" members default
+        # to None so that a blank value is reported when the MTA-STS scan
+        # was not run for this domain.
+        self.mta_sts_record = None
+        self.mta_sts_record_dnssec = None
+        self.has_mta_sts_record = None
+        self.valid_mta_sts = None
+        self.mta_sts_policy = None
+        self.mta_sts_policy_mode = None
+        self.mta_sts_policy_mx = []
+        self.mta_sts_policy_max_age = None
+
+        # SMTP TLS Reporting (TLS-RPT) info (RFC 8460).
+        self.tlsrpt_record = None
+        self.tlsrpt_record_dnssec = None
+        self.has_tlsrpt_record = None
+        self.valid_tlsrpt = None
+        self.tlsrpt_ruas = []
 
         # Syntax validity - default spf to false as the lack of an SPF is a bad thing.
         self.valid_spf = False
@@ -184,6 +209,14 @@ class Domain:
         if self.dmarc is not None:
             return len(self.dmarc) > 0
         return None
+
+    def has_mta_sts(self):
+        """Check if this domain publishes an MTA-STS record."""
+        return self.has_mta_sts_record
+
+    def has_tlsrpt(self):
+        """Check if this domain publishes an SMTP TLS Reporting (TLS-RPT) record."""
+        return self.has_tlsrpt_record
 
     def add_mx_record(self, record):
         """Add a mail server record for this domain."""
@@ -377,6 +410,18 @@ class Domain:
                     "DMARC Reporting Address Acceptance Error",
                     self.dmarc_reports_address_error,
                 ),
+                ("MTA-STS Record", self.has_mta_sts()),
+                ("MTA-STS Record DNSSEC", self.mta_sts_record_dnssec),
+                ("Valid MTA-STS", self.valid_mta_sts),
+                ("MTA-STS Results", self.mta_sts_record),
+                ("MTA-STS Policy Mode", self.mta_sts_policy_mode),
+                ("MTA-STS Policy MX", format_list(self.mta_sts_policy_mx)),
+                ("MTA-STS Policy Max Age", self.mta_sts_policy_max_age),
+                ("TLS-RPT Record", self.has_tlsrpt()),
+                ("TLS-RPT Record DNSSEC", self.tlsrpt_record_dnssec),
+                ("Valid TLS-RPT", self.valid_tlsrpt),
+                ("TLS-RPT Results", self.tlsrpt_record),
+                ("TLS-RPT Report URIs", format_list(self.tlsrpt_ruas)),
                 ("Syntax Errors", format_list(self.syntax_errors)),
                 ("Debug Info", format_list(self.debug_info)),
             ]

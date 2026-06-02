@@ -781,6 +781,290 @@ def dmarc_scan(resolver, domain):
         handle_error("[DMARC]", domain, error)
 
 
+# The largest acceptable value for the MTA-STS policy max_age field, in
+# seconds (RFC 8461 section 3.2).
+MTA_STS_MAX_AGE_LIMIT = 31557600
+
+
+def parse_semicolon_tags(record_text):
+    """Parse a semicolon-delimited ``tag=value`` DNS record into a dictionary.
+
+    This is the format used by both MTA-STS (RFC 8461) and TLS-RPT
+    (RFC 8460) TXT records.
+
+    Parameters
+    ----------
+    record_text : str
+        The text of the record to parse.
+
+    Returns
+    -------
+    dict: A mapping of each tag to its value.
+    """
+    tag_dict = {}
+    for option in record_text.split(";"):
+        if "=" not in option:
+            continue
+        tag, _, value = option.partition("=")
+        tag_dict[tag.strip()] = value.strip()
+    return tag_dict
+
+
+def fetch_mta_sts_policy(domain, timeout):
+    """Fetch and validate a domain's MTA-STS policy file.
+
+    The policy is retrieved over HTTPS from the well-known location
+    defined in RFC 8461 section 3.3 and validated against the
+    requirements in section 3.2.  Results are recorded on the Domain
+    object that is passed in.
+
+    Parameters
+    ----------
+    domain : trustymail.Domain
+        The Domain object whose MTA-STS policy is being fetched.  Any
+        errors will be logged to this object.
+
+    timeout : int
+        The HTTP connection timeout in seconds.
+    """
+    policy_url = "https://mta-sts.%s/.well-known/mta-sts.txt" % domain.domain_name
+    try:
+        # Per RFC 8461 section 3.3 the policy must be served over HTTPS;
+        # redirects are not permitted and so are not followed.
+        response = requests.get(policy_url, timeout=timeout, allow_redirects=False)
+    except requests.RequestException as error:
+        handle_error("[MTA-STS]", domain, f"Unable to retrieve MTA-STS policy: {error}")
+        domain.valid_mta_sts = False
+        return
+
+    if response.status_code != 200:
+        handle_syntax_error(
+            "[MTA-STS]",
+            domain,
+            f"MTA-STS policy request returned HTTP {response.status_code}",
+        )
+        domain.valid_mta_sts = False
+        return
+
+    domain.mta_sts_policy = response.text
+
+    # The policy file is a set of newline-separated "key: value" lines.
+    # The mx key may appear multiple times, so it is collected separately.
+    policy = {}
+    mx_hosts = []
+    for line in response.text.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if key == "mx":
+            mx_hosts.append(value)
+        else:
+            policy[key] = value
+    domain.mta_sts_policy_mx = mx_hosts
+
+    if policy.get("version") != "STSv1":
+        handle_syntax_error(
+            "[MTA-STS]", domain, "MTA-STS policy is missing a valid version field"
+        )
+        domain.valid_mta_sts = False
+
+    mode = policy.get("mode")
+    domain.mta_sts_policy_mode = mode
+    if mode not in ("enforce", "testing", "none"):
+        handle_syntax_error("[MTA-STS]", domain, f"Invalid MTA-STS policy mode: {mode}")
+        domain.valid_mta_sts = False
+
+    max_age = policy.get("max_age")
+    if max_age is None:
+        handle_syntax_error(
+            "[MTA-STS]", domain, "MTA-STS policy is missing the required max_age field"
+        )
+        domain.valid_mta_sts = False
+    else:
+        try:
+            max_age_int = int(max_age)
+            domain.mta_sts_policy_max_age = max_age_int
+            if max_age_int < 0 or max_age_int > MTA_STS_MAX_AGE_LIMIT:
+                handle_syntax_error(
+                    "[MTA-STS]",
+                    domain,
+                    f"MTA-STS policy max_age {max_age_int} is outside the allowed"
+                    " range",
+                )
+                domain.valid_mta_sts = False
+        except ValueError:
+            handle_syntax_error(
+                "[MTA-STS]", domain, f"Invalid MTA-STS policy max_age value: {max_age}"
+            )
+            domain.valid_mta_sts = False
+
+    # Any mode other than "none" must list at least one mx host.
+    if mode != "none" and not mx_hosts:
+        handle_syntax_error(
+            "[MTA-STS]", domain, "MTA-STS policy does not list any mx hosts"
+        )
+        domain.valid_mta_sts = False
+
+
+def mta_sts_scan(resolver, domain, timeout):
+    """Scan a domain to see if it supports MTA-STS (RFC 8461).
+
+    Checks for the ``_mta-sts`` TXT record and, when present, fetches
+    and validates the corresponding policy file.  All results are
+    stored on the Domain object that is passed in.
+
+    Parameters
+    ----------
+    resolver : dns.resolver.Resolver
+        The Resolver object to use for DNS queries.
+
+    domain : trustymail.Domain
+        The Domain object being scanned for MTA-STS support.  Any
+        errors will be logged to this object.
+
+    timeout : int
+        The HTTP connection timeout in seconds used when fetching the
+        policy file.
+    """
+    domain.has_mta_sts_record = False
+    sts_domain = "_mta-sts.%s" % domain.domain_name
+    try:
+        all_records = resolver.query(sts_domain, "TXT", tcp=True)
+        domain.mta_sts_record_dnssec = check_dnssec(domain, sts_domain, "TXT")
+        # Per RFC 8461 section 3.1, only records beginning with the
+        # version tag are considered MTA-STS records.
+        records = [
+            remove_quotes(record.to_text())
+            for record in all_records
+            if remove_quotes(record.to_text()).startswith("v=STSv1")
+        ]
+
+        # Multiple records is an error (RFC 8461 section 3.1).
+        if len(records) > 1:
+            handle_error(
+                "[MTA-STS]", domain, "Warning: Multiple MTA-STS records present"
+            )
+            domain.has_mta_sts_record = True
+            domain.valid_mta_sts = False
+        elif records:
+            domain.has_mta_sts_record = True
+            record_text = records[0]
+            domain.mta_sts_record = record_text
+
+            # The record must carry a syntactically valid id tag.
+            tag_dict = parse_semicolon_tags(record_text)
+            sts_id = tag_dict.get("id")
+            if not sts_id:
+                handle_syntax_error(
+                    "[MTA-STS]", domain, "MTA-STS record is missing the required id tag"
+                )
+                domain.valid_mta_sts = False
+            elif not re.fullmatch(r"[A-Za-z0-9]{1,32}", sts_id):
+                handle_syntax_error(
+                    "[MTA-STS]", domain, f"Invalid MTA-STS id tag value: {sts_id}"
+                )
+                domain.valid_mta_sts = False
+            else:
+                domain.valid_mta_sts = True
+
+            # Fetch the policy regardless so that the mode and mx hosts
+            # are surfaced; this may downgrade valid_mta_sts to False.
+            fetch_mta_sts_policy(domain, timeout)
+        else:
+            domain.valid_mta_sts = False
+    except (
+        dns.resolver.NoAnswer,
+        dns.resolver.NXDOMAIN,
+        dns.exception.Timeout,
+    ) as error:
+        domain.mta_sts_record_dnssec = check_dnssec(domain, sts_domain, "TXT")
+        domain.valid_mta_sts = False
+        handle_error("[MTA-STS]", domain, error)
+    except dns.resolver.NoNameservers as error:
+        # As with DMARC, a NoNameservers result here is not treated as
+        # the domain being "not live" because the query is against the
+        # _mta-sts subdomain rather than the domain itself.
+        domain.valid_mta_sts = False
+        handle_error("[MTA-STS]", domain, error)
+
+
+def tls_rpt_scan(resolver, domain):
+    """Scan a domain to see if it publishes a TLS-RPT record (RFC 8460).
+
+    Checks for the ``_smtp._tls`` TXT record that tells sending mail
+    servers where to report SMTP TLS negotiation failures.  All results
+    are stored on the Domain object that is passed in.
+
+    Parameters
+    ----------
+    resolver : dns.resolver.Resolver
+        The Resolver object to use for DNS queries.
+
+    domain : trustymail.Domain
+        The Domain object being scanned for TLS-RPT support.  Any
+        errors will be logged to this object.
+    """
+    domain.has_tlsrpt_record = False
+    tlsrpt_domain = "_smtp._tls.%s" % domain.domain_name
+    try:
+        all_records = resolver.query(tlsrpt_domain, "TXT", tcp=True)
+        domain.tlsrpt_record_dnssec = check_dnssec(domain, tlsrpt_domain, "TXT")
+        records = [
+            remove_quotes(record.to_text())
+            for record in all_records
+            if remove_quotes(record.to_text()).startswith("v=TLSRPTv1")
+        ]
+
+        # Multiple records is an error (RFC 8460 section 3).
+        if len(records) > 1:
+            handle_error(
+                "[TLS-RPT]", domain, "Warning: Multiple TLS-RPT records present"
+            )
+            domain.has_tlsrpt_record = True
+            domain.valid_tlsrpt = False
+        elif records:
+            domain.has_tlsrpt_record = True
+            record_text = records[0]
+            domain.tlsrpt_record = record_text
+
+            tag_dict = parse_semicolon_tags(record_text)
+            rua = tag_dict.get("rua")
+            if not rua:
+                handle_syntax_error(
+                    "[TLS-RPT]",
+                    domain,
+                    "TLS-RPT record is missing the required rua tag",
+                )
+                domain.valid_tlsrpt = False
+            else:
+                # rua is a comma-separated list of mailto: or https: URIs.
+                valid = True
+                for uri in [u.strip() for u in rua.split(",") if u.strip()]:
+                    if uri.startswith("mailto:") or uri.startswith("https://"):
+                        domain.tlsrpt_ruas.append(uri)
+                    else:
+                        handle_syntax_error(
+                            "[TLS-RPT]", domain, f"Invalid TLS-RPT rua URI: {uri}"
+                        )
+                        valid = False
+                domain.valid_tlsrpt = valid and bool(domain.tlsrpt_ruas)
+        else:
+            domain.valid_tlsrpt = False
+    except (
+        dns.resolver.NoAnswer,
+        dns.resolver.NXDOMAIN,
+        dns.exception.Timeout,
+    ) as error:
+        domain.tlsrpt_record_dnssec = check_dnssec(domain, tlsrpt_domain, "TXT")
+        domain.valid_tlsrpt = False
+        handle_error("[TLS-RPT]", domain, error)
+    except dns.resolver.NoNameservers as error:
+        domain.valid_tlsrpt = False
+        handle_error("[TLS-RPT]", domain, error)
+
+
 def find_host_from_ip(resolver, ip_addr):
     """Find the host name for a given IP address."""
     # Use TCP, since we care about the content and correctness of the records
@@ -873,17 +1157,24 @@ def scan(
     if scan_types["dmarc"] and domain.is_live:
         dmarc_scan(resolver, domain)
 
+    if scan_types.get("mta_sts") and domain.is_live:
+        mta_sts_scan(resolver, domain, timeout)
+        tls_rpt_scan(resolver, domain)
+
     # If the user didn't specify any scans then run a full scan.
     if domain.is_live and not (
         scan_types["mx"]
         or scan_types["starttls"]
         or scan_types["spf"]
         or scan_types["dmarc"]
+        or scan_types.get("mta_sts")
     ):
         mx_scan(resolver, domain)
         starttls_scan(domain, smtp_timeout, smtp_localhost, smtp_ports, smtp_cache)
         spf_scan(resolver, domain)
         dmarc_scan(resolver, domain)
+        mta_sts_scan(resolver, domain, timeout)
+        tls_rpt_scan(resolver, domain)
 
     return domain
 

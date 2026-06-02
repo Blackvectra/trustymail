@@ -9,7 +9,9 @@
 
 `trustymail` is a tool that evaluates SPF/DMARC records set in a
 domain's DNS. It also checks the mail servers listed in a domain's MX
-records for STARTTLS support. It saves its results to CSV or JSON.
+records for STARTTLS support, and evaluates a domain's MTA-STS
+(RFC 8461) and SMTP TLS Reporting (TLS-RPT, RFC 8460) configuration. It
+saves its results to CSV or JSON.
 
 ## Getting started ##
 
@@ -76,6 +78,7 @@ output will always be written to disk, defaulting to `results.csv`.
                               (Implies --mx.)
   --spf                       Only check SPF records.
   --dmarc                     Only check DMARC records.
+  --mta-sts                   Only check MTA-STS and TLS-RPT records.
   --json                      Output is in JSON format.  (Default is CSV.)
   --debug                     Output should include more verbose logging.
   --dns=HOSTNAMES             A comma-delimited list of DNS servers to query
@@ -100,8 +103,11 @@ output will always be written to disk, defaulting to `results.csv`.
 ## What's checked? ##
 
 For a given domain, MX records, SPF records (TXT), DMARC (TXT, at
-`_dmarc.<domain>`), and support for STARTTLS are checked. Resource records can
-also be checked for DNSSEC if the resolver used is DNSSEC-aware.
+`_dmarc.<domain>`), support for STARTTLS, MTA-STS (TXT at
+`_mta-sts.<domain>` plus the policy published at
+`https://mta-sts.<domain>/.well-known/mta-sts.txt`), and TLS-RPT (TXT
+at `_smtp._tls.<domain>`) are checked. Resource records can also be
+checked for DNSSEC if the resolver used is DNSSEC-aware.
 
 The following values are returned in `results.csv`:
 
@@ -182,6 +188,37 @@ The following values are returned in `results.csv`:
   True if one or more of the domains listed in the aggregate and
   forensic report URIs does not indicate that it accepts DMARC reports
   from the domain being tested.
+
+### SMTP MTA Strict Transport Security (MTA-STS) ###
+
+- `MTA-STS Record` - True/False whether or not an MTA-STS record was
+  found at `_mta-sts.<domain>`.
+- `MTA-STS Record DNSSEC` - A boolean value indicating whether or not
+  the DNS record is protected by DNSSEC.
+- `Valid MTA-STS` - Whether the MTA-STS record and its associated
+  policy file are syntactically correct, per [RFC
+  8461](https://tools.ietf.org/html/rfc8461).
+- `MTA-STS Results` - The MTA-STS record that was discovered when
+  querying DNS.
+- `MTA-STS Policy Mode` - The `mode` declared in the policy file:
+  `enforce`, `testing`, or `none`.
+- `MTA-STS Policy MX` - The list of `mx` host patterns declared in the
+  policy file.
+- `MTA-STS Policy Max Age` - The `max_age` (in seconds) declared in the
+  policy file.
+
+### SMTP TLS Reporting (TLS-RPT) ###
+
+- `TLS-RPT Record` - True/False whether or not a TLS-RPT record was
+  found at `_smtp._tls.<domain>`.
+- `TLS-RPT Record DNSSEC` - A boolean value indicating whether or not
+  the DNS record is protected by DNSSEC.
+- `Valid TLS-RPT` - Whether the TLS-RPT record is syntactically
+  correct, per [RFC 8460](https://tools.ietf.org/html/rfc8460).
+- `TLS-RPT Results` - The TLS-RPT record that was discovered when
+  querying DNS.
+- `TLS-RPT Report URIs` - A list of the `rua` reporting URIs (`mailto:`
+  or `https:`) specified by the domain.
 
 ### Everything else ###
 
