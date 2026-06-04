@@ -420,6 +420,86 @@ class TestGenerateResults(unittest.TestCase):
         self.assertIsNone(results["Blacklisted"])
 
 
+class TestComputeGrade(unittest.TestCase):
+    """Test the A-F email-security scorecard."""
+
+    def _spf_dmarc_domain(self, policy="reject"):
+        """Return a domain with a valid SPF and DMARC record set."""
+        domain = _make_domain()
+        domain.spf = ["v=spf1 -all"]
+        domain.valid_spf = True
+        domain.dmarc = ["v=DMARC1; p={}".format(policy)]
+        domain.valid_dmarc = True
+        domain.dmarc_policy = policy
+        return domain
+
+    def test_no_applicable_checks_returns_none(self):
+        """A domain with nothing scanned has no grade."""
+        domain = _make_domain()
+        self.assertEqual(domain.compute_grade(), (None, None))
+
+    def test_letter_grade_thresholds(self):
+        """Scores map to the expected letter boundaries."""
+        self.assertEqual(Domain._letter_grade(90), "A")
+        self.assertEqual(Domain._letter_grade(89), "B")
+        self.assertEqual(Domain._letter_grade(70), "C")
+        self.assertEqual(Domain._letter_grade(60), "D")
+        self.assertEqual(Domain._letter_grade(59), "F")
+
+    def test_perfect_spf_and_dmarc_reject(self):
+        """Valid SPF plus a DMARC reject policy earns an A."""
+        domain = self._spf_dmarc_domain("reject")
+        grade, score = domain.compute_grade()
+        self.assertEqual(score, 100)
+        self.assertEqual(grade, "A")
+
+    def test_dmarc_none_policy_scores_lower(self):
+        """A monitoring-only DMARC policy grades below reject."""
+        reject_score = self._spf_dmarc_domain("reject").compute_grade()[1]
+        none_score = self._spf_dmarc_domain("none").compute_grade()[1]
+        self.assertLess(none_score, reject_score)
+
+    def test_missing_spf_lowers_grade(self):
+        """A missing SPF record costs its full weight."""
+        domain = self._spf_dmarc_domain("reject")
+        domain.spf = []
+        domain.valid_spf = False
+        grade, score = domain.compute_grade()
+        # DMARC (30, full) is all that is earned out of 55 in play.
+        self.assertEqual(score, round(30 / 55 * 100))
+
+    def test_starttls_fraction_counts_only_smtp_servers(self):
+        """STARTTLS credit is the share of SMTP servers offering it."""
+        domain = self._spf_dmarc_domain("reject")
+        domain.mail_servers = ["a.example.com", "b.example.com"]
+        domain.starttls_results = {
+            "a.example.com": {"supports_smtp": True, "starttls": True},
+            "b.example.com": {"supports_smtp": True, "starttls": False},
+        }
+        grade, score = domain.compute_grade()
+        # 25 (SPF) + 30 (DMARC) + 10 (half of 20 STARTTLS) of 75 in play.
+        self.assertEqual(score, round((25 + 30 + 10) / 75 * 100))
+
+    def test_blacklisting_zeroes_its_category(self):
+        """A DNSBL listing removes the full blacklist weight."""
+        domain = self._spf_dmarc_domain("reject")
+        domain.mail_servers = ["a.example.com"]
+        domain.dnsbls_checked = ["zen.spamhaus.org"]
+        domain.blacklist_results = {"192.0.2.1": {"zen.spamhaus.org": True}}
+        grade, score = domain.compute_grade()
+        # 25 + 30 earned of 25 + 30 + 15 in play (blacklist earns nothing).
+        self.assertEqual(score, round(55 / 70 * 100))
+
+    def test_grade_appears_in_results(self):
+        """The Grade and Score columns surface in the results."""
+        domain = self._spf_dmarc_domain("reject")
+        results = domain.generate_results()
+        self.assertIn("Grade", results)
+        self.assertIn("Score", results)
+        self.assertEqual(results["Grade"], "A")
+        self.assertEqual(results["Score"], 100)
+
+
 class TestCheckDkimRecord(unittest.TestCase):
     """Test validation of individual DKIM key records."""
 

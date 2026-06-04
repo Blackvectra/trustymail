@@ -277,6 +277,134 @@ class Domain:
             return None
         return len(self.blacklist_listings()) > 0
 
+    @staticmethod
+    def _letter_grade(score):
+        """Map a 0-100 score to a letter grade (A-F)."""
+        if score >= 90:
+            return "A"
+        if score >= 80:
+            return "B"
+        if score >= 70:
+            return "C"
+        if score >= 60:
+            return "D"
+        return "F"
+
+    def compute_grade(self):
+        """Summarize this domain's email-security posture as a letter grade.
+
+        Each applicable check contributes a weighted fraction (0.0-1.0) of
+        a category's points.  A category is only counted when the data
+        needed to judge it was actually collected, so a scan limited to a
+        subset of checks is graded only on what it measured.  The earned
+        points are normalized against the points that were in play, then
+        mapped to a letter grade.
+
+        Returns
+        -------
+        tuple
+            ``(grade, score)`` where ``score`` is an integer 0-100 and
+            ``grade`` is one of ``A``, ``B``, ``C``, ``D``, ``F``.  Returns
+            ``(None, None)`` when no graded check applied to this domain.
+        """
+        # Each entry is ``(weight, fraction_earned)``.
+        categories = []
+
+        # SPF (weight 25) - applicable whenever SPF was scanned.  A domain
+        # should publish SPF even when it sends no mail (``v=spf1 -all``).
+        if self.has_spf() is not None:
+            if not self.has_spf():
+                fraction = 0.0
+            elif self.valid_spf:
+                fraction = 1.0
+            else:
+                fraction = 0.4
+            categories.append((25, fraction))
+
+        # DMARC (weight 30) - applicable whenever DMARC was scanned.  A
+        # record inherited from the base domain counts, per RFC 7489, and
+        # a stronger enforcement policy earns more credit.
+        if self.has_dmarc() is not None:
+            if not self.parent_has_dmarc():
+                fraction = 0.0
+            elif not self.parent_valid_dmarc():
+                fraction = 0.3
+            else:
+                policy = (self.get_dmarc_policy() or "").lower()
+                if policy == "reject":
+                    fraction = 1.0
+                elif policy == "quarantine":
+                    fraction = 0.85
+                else:  # "none" - monitoring only
+                    fraction = 0.6
+            categories.append((30, fraction))
+
+        # STARTTLS (weight 20) - applicable only to domains that receive
+        # mail and were tested for STARTTLS support.  Credit is the share
+        # of SMTP-speaking mail servers that offer STARTTLS.
+        if self.has_mail() and self.starttls_results:
+            smtp_servers = [
+                server
+                for server in self.starttls_results
+                if self.starttls_results[server]["supports_smtp"]
+            ]
+            if smtp_servers:
+                starttls_servers = [
+                    server
+                    for server in smtp_servers
+                    if self.starttls_results[server]["starttls"]
+                ]
+                categories.append((20, len(starttls_servers) / len(smtp_servers)))
+
+        # MTA-STS (weight 15) - applicable to mail-receiving domains that
+        # were scanned.  An enforced policy earns full credit; a testing
+        # policy earns partial credit.
+        if self.has_mail() and self.has_mta_sts_record is not None:
+            if not self.has_mta_sts_record:
+                fraction = 0.0
+            elif not self.valid_mta_sts:
+                fraction = 0.3
+            elif (self.mta_sts_policy_mode or "").lower() == "enforce":
+                fraction = 1.0
+            else:  # testing/none mode
+                fraction = 0.6
+            categories.append((15, fraction))
+
+        # TLS-RPT (weight 5) - applicable to mail-receiving domains that
+        # were scanned.
+        if self.has_mail() and self.has_tlsrpt_record is not None:
+            if not self.has_tlsrpt_record:
+                fraction = 0.0
+            elif self.valid_tlsrpt:
+                fraction = 1.0
+            else:
+                fraction = 0.5
+            categories.append((5, fraction))
+
+        # DKIM (weight 10) - applicable only when selectors were supplied
+        # and tested, since DKIM selectors cannot be discovered from DNS.
+        if self.dkim_results:
+            if not self.has_dkim():
+                fraction = 0.0
+            elif self.valid_dkim():
+                fraction = 1.0
+            else:
+                fraction = 0.5
+            categories.append((10, fraction))
+
+        # Blacklist (weight 15) - applicable only when a DNSBL scan tested
+        # at least one mail server IP.  Any listing zeroes the category.
+        if self.blacklist_results:
+            categories.append((15, 0.0 if self.is_blacklisted() else 1.0))
+
+        total_weight = sum(weight for weight, _ in categories)
+        if total_weight == 0:
+            return (None, None)
+
+        earned = sum(weight * fraction for weight, fraction in categories)
+        score = round(earned / total_weight * 100)
+        return (self._letter_grade(score), score)
+
     def add_mx_record(self, record):
         """Add a mail server record for this domain."""
         if self.mx_records is None:
@@ -415,11 +543,16 @@ class Domain:
         # The mail server IP addresses that were checked against DNSBLs.
         dkim_blacklist_ips = list(self.blacklist_results.keys())
 
+        # An at-a-glance A-F grade summarizing the checks that applied.
+        grade, score = self.compute_grade()
+
         results = OrderedDict(
             [
                 ("Domain", self.domain_name),
                 ("Base Domain", self.base_domain_name),
                 ("Live", self.is_live),
+                ("Grade", grade),
+                ("Score", score),
                 ("MX Record", self.has_mail()),
                 ("MX Record DNSSEC", self.mx_records_dnssec),
                 ("Mail Servers", format_list(self.mail_servers)),

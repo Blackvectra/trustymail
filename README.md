@@ -128,6 +128,10 @@ records (TXT, at `<selector>._domainkey.<domain>`, for selectors
 supplied with `--dkim-selectors`) and DNS blocklist (DNSBL) lookups of
 the domain's mail server IP addresses (enabled with `--blacklist`).
 
+Every scan also produces an at-a-glance letter `Grade` (see
+[Scorecard](#scorecard) below) that summarizes the checks that
+applied to the domain.
+
 The following values are returned in `results.csv`:
 
 ### Domain and redirect info ###
@@ -139,6 +143,9 @@ The following values are returned in `results.csv`:
   `trustymail` will download and factor in the [Public Suffix
   List](https://publicsuffix.org) when calculating the base domain.
 - `Live` - The domain is actually published in the DNS.
+- `Grade` - An A-F letter grade summarizing the domain's email
+  security posture. See [Scorecard](#scorecard) below.
+- `Score` - The 0-100 numeric score that the `Grade` is derived from.
 
 ### Mail sending ###
 
@@ -282,6 +289,37 @@ unreliable results when queried from public or cloud resolvers.  Use
   such as DNS failures.  These can be helpful when determining how
   `trustymail` reached its conclusions, and are indispensible for bug
   reports.
+
+## Scorecard ##
+
+Every scan rolls its findings up into a single letter `Grade` (A-F) and
+a numeric `Score` (0-100), reported in the `Grade` and `Score` columns,
+so a long row of records can be read at a glance.
+
+A check only counts toward the score when the data needed to judge it
+was actually collected.  This means a scan limited to a subset of checks
+(for example `--spf`) is graded only on what it measured, and checks
+that do not apply to a domain (such as STARTTLS for a domain that
+receives no mail) are skipped rather than counted as failures.  The
+earned points are normalized against the points that were in play, so
+the score is always out of 100 regardless of which checks ran.
+
+The categories and their weights are:
+
+| Category | Weight | Full credit when… |
+| --- | ---: | --- |
+| SPF | 25 | a valid SPF record is published (partial credit if present but invalid) |
+| DMARC | 30 | a valid DMARC record applies with a `reject` policy (`quarantine` and `none` earn progressively less) |
+| STARTTLS | 20 | every SMTP-speaking mail server offers STARTTLS (credit scales with the fraction that do) |
+| MTA-STS | 15 | a valid policy is in `enforce` mode (`testing` mode earns partial credit) |
+| TLS-RPT | 5 | a valid TLS-RPT record is published |
+| DKIM | 10 | every tested selector that returned a record is valid (only counted when `--dkim-selectors` is supplied) |
+| Blacklist | 15 | no tested mail server IP is listed on any DNSBL (only counted when `--blacklist` is supplied) |
+
+The numeric score maps to a letter grade on the usual scale: **A** ≥ 90,
+**B** ≥ 80, **C** ≥ 70, **D** ≥ 60, and **F** below 60.  When no graded
+check applies to a domain, the `Grade` and `Score` columns are left
+blank.
 
 ## Contributing ##
 
