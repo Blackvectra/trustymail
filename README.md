@@ -233,6 +233,19 @@ The following values are returned in `results.csv`:
 - `MTA-STS Policy Max Age` - The `max_age` (in seconds) declared in the
   policy file.
 
+Fetching the policy file means making an HTTPS request to a host
+(`mta-sts.<domain>`) that the scanned domain controls.  To keep that
+request from being abused, `trustymail`:
+
+- verifies, before connecting, that `mta-sts.<domain>` resolves only to
+  publicly routable addresses, rejecting loopback, private, link-local
+  (including the cloud metadata address `169.254.169.254`), and other
+  reserved addresses.  This blocks server-side request forgery (SSRF)
+  via a hostile or misconfigured record;
+- requires valid TLS and does not follow redirects, per RFC 8461; and
+- streams the response and caps it at 64&nbsp;KiB so an oversized body
+  or a decompression bomb cannot exhaust memory.
+
 ### SMTP TLS Reporting (TLS-RPT) ###
 
 - `TLS-RPT Record` - True/False whether or not a TLS-RPT record was

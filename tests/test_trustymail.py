@@ -45,12 +45,27 @@ class _FakeResolver:
 
 
 class _FakeResponse:
-    """A minimal stand-in for a requests.Response object."""
+    """A minimal stand-in for a streamed requests.Response object."""
 
     def __init__(self, status_code=200, text=""):
         """Store the status code and body text."""
         self.status_code = status_code
         self.text = text
+
+    def __enter__(self):
+        """Support use as a context manager."""
+        return self
+
+    def __exit__(self, *exc_info):
+        """Support use as a context manager."""
+        return False
+
+    def iter_content(self, chunk_size=1):
+        """Yield the body as byte chunks, mimicking a streamed response."""
+        data = self.text.encode("utf-8")
+        for start in range(0, len(data), chunk_size):
+            end = start + chunk_size
+            yield data[start:end]
 
 
 def _make_domain(name="example.com"):
@@ -154,7 +169,11 @@ class TestFetchMtaStsPolicy(unittest.TestCase):
             kwargs["side_effect"] = side_effect
         else:
             kwargs["return_value"] = response
-        with mock.patch.object(trustymail.requests, "get", **kwargs):
+        # The SSRF guard performs real DNS resolution, so stub it out to a
+        # benign public address for these policy-parsing tests.
+        with mock.patch.object(
+            trustymail, "validate_mta_sts_host", return_value=["192.0.2.1"]
+        ), mock.patch.object(trustymail.requests, "get", **kwargs):
             trustymail.fetch_mta_sts_policy(self.domain, 5)
 
     def test_valid_enforce_policy(self):
@@ -222,6 +241,112 @@ class TestFetchMtaStsPolicy(unittest.TestCase):
             any("Unable to retrieve" in info for info in self.domain.debug_info)
         )
 
+    def test_oversized_policy_is_rejected(self):
+        """A policy body larger than the cap is rejected without parsing."""
+        big_policy = "version: STSv1\n" + ("#padding\n" * 100000)
+        self.assertGreater(
+            len(big_policy.encode("utf-8")), trustymail.MTA_STS_POLICY_MAX_BYTES
+        )
+        self._fetch(_FakeResponse(200, big_policy))
+        self.assertFalse(self.domain.valid_mta_sts)
+        self.assertTrue(
+            any("maximum allowed size" in err for err in self.domain.syntax_errors)
+        )
+
+    def test_ssrf_guard_blocks_non_public_host(self):
+        """A policy host resolving to a private address is not fetched."""
+        with mock.patch.object(
+            trustymail,
+            "validate_mta_sts_host",
+            side_effect=trustymail.MtaStsFetchError(
+                "mta-sts.example.com resolves to non-public address 127.0.0.1"
+            ),
+        ), mock.patch.object(trustymail.requests, "get") as mock_get:
+            trustymail.fetch_mta_sts_policy(self.domain, 5)
+        # The request must never be issued when the host fails validation.
+        mock_get.assert_not_called()
+        self.assertFalse(self.domain.valid_mta_sts)
+        self.assertTrue(
+            any("non-public address" in info for info in self.domain.debug_info)
+        )
+
+
+class TestValidateMtaStsHost(unittest.TestCase):
+    """Test the SSRF guard that validates MTA-STS policy hosts."""
+
+    @staticmethod
+    def _addrinfo(*ip_addresses):
+        """Build a getaddrinfo-style result list for the given IPs."""
+        return [(None, None, None, "", (ip, 443)) for ip in ip_addresses]
+
+    def test_public_address_is_allowed(self):
+        """A host resolving only to public addresses is accepted."""
+        with mock.patch.object(
+            trustymail.socket,
+            "getaddrinfo",
+            return_value=self._addrinfo("93.184.216.34"),
+        ):
+            self.assertEqual(
+                trustymail.validate_mta_sts_host("mta-sts.example.com"),
+                ["93.184.216.34"],
+            )
+
+    def test_loopback_address_is_rejected(self):
+        """A loopback address is rejected."""
+        with mock.patch.object(
+            trustymail.socket, "getaddrinfo", return_value=self._addrinfo("127.0.0.1")
+        ):
+            with self.assertRaises(trustymail.MtaStsFetchError):
+                trustymail.validate_mta_sts_host("mta-sts.example.com")
+
+    def test_private_address_is_rejected(self):
+        """An RFC 1918 private address is rejected."""
+        with mock.patch.object(
+            trustymail.socket, "getaddrinfo", return_value=self._addrinfo("10.0.0.5")
+        ):
+            with self.assertRaises(trustymail.MtaStsFetchError):
+                trustymail.validate_mta_sts_host("mta-sts.example.com")
+
+    def test_cloud_metadata_address_is_rejected(self):
+        """The link-local cloud metadata address is rejected."""
+        with mock.patch.object(
+            trustymail.socket,
+            "getaddrinfo",
+            return_value=self._addrinfo("169.254.169.254"),
+        ):
+            with self.assertRaises(trustymail.MtaStsFetchError):
+                trustymail.validate_mta_sts_host("mta-sts.example.com")
+
+    def test_ipv4_mapped_loopback_is_rejected(self):
+        """An IPv4-mapped IPv6 loopback address is unwrapped and rejected."""
+        with mock.patch.object(
+            trustymail.socket,
+            "getaddrinfo",
+            return_value=self._addrinfo("::ffff:127.0.0.1"),
+        ):
+            with self.assertRaises(trustymail.MtaStsFetchError):
+                trustymail.validate_mta_sts_host("mta-sts.example.com")
+
+    def test_any_non_public_address_rejects_the_host(self):
+        """If a host mixes public and private addresses it is rejected."""
+        with mock.patch.object(
+            trustymail.socket,
+            "getaddrinfo",
+            return_value=self._addrinfo("93.184.216.34", "10.0.0.5"),
+        ):
+            with self.assertRaises(trustymail.MtaStsFetchError):
+                trustymail.validate_mta_sts_host("mta-sts.example.com")
+
+    def test_resolution_failure_is_wrapped(self):
+        """A DNS resolution failure is reported as a fetch error."""
+        with mock.patch.object(
+            trustymail.socket,
+            "getaddrinfo",
+            side_effect=trustymail.socket.gaierror("no such host"),
+        ):
+            with self.assertRaises(trustymail.MtaStsFetchError):
+                trustymail.validate_mta_sts_host("mta-sts.example.com")
+
 
 class TestMtaStsScan(unittest.TestCase):
     """Test the MTA-STS DNS record scan."""
@@ -233,6 +358,8 @@ class TestMtaStsScan(unittest.TestCase):
     def _scan(self, resolver, policy_response=None):
         with mock.patch.object(
             trustymail, "check_dnssec", return_value=True
+        ), mock.patch.object(
+            trustymail, "validate_mta_sts_host", return_value=["192.0.2.1"]
         ), mock.patch.object(
             trustymail.requests,
             "get",
