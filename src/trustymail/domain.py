@@ -3,14 +3,42 @@
 # Standard Python Libraries
 from collections import OrderedDict
 from datetime import datetime, timedelta
-from os import path, stat, utime
+from os import path, replace, stat, utime
 from typing import Dict
 
 # Third-Party Libraries
 from publicsuffixlist.compat import PublicSuffixList
-from publicsuffixlist.update import updatePSL
+from publicsuffixlist.update import PSLURL
 
-from . import PublicSuffixListFilename, PublicSuffixListReadOnly
+from . import PublicSuffixListFilename, PublicSuffixListReadOnly, safe_fetch
+
+# The largest public suffix list we are willing to download into memory.
+# The published list is on the order of a few hundred KiB; this ceiling
+# leaves ample room for growth while still bounding memory use and
+# guarding against an oversized or runaway response.
+PSL_MAX_BYTES = 16 * 1024 * 1024
+
+# The timeout, in seconds, for downloading the public suffix list.
+PSL_FETCH_TIMEOUT = 30
+
+
+def download_psl(psl_file):
+    """Download the public suffix list to psl_file, safely.
+
+    The list is fetched through :mod:`trustymail.safe_fetch`, so the
+    download is size-capped and the (fixed, public) host is validated and
+    pinned over verified TLS -- the same protections applied to every
+    other HTTP fetch trustymail makes.  The file is written atomically by
+    downloading to a temporary path and replacing the destination.
+    """
+    data = safe_fetch.fetch_bytes(PSLURL, PSL_FETCH_TIMEOUT, PSL_MAX_BYTES)
+    if not data:
+        raise safe_fetch.SafeFetchError(f"downloaded an empty PSL from {PSLURL}")
+
+    swap_file = psl_file + ".swp"
+    with open(swap_file, "wb") as f:
+        f.write(data)
+    replace(swap_file, psl_file)
 
 
 def get_psl():
@@ -23,14 +51,14 @@ def get_psl():
     # Download the PSL if necessary
     if not PublicSuffixListReadOnly:
         if not path.exists(PublicSuffixListFilename):
-            updatePSL(PublicSuffixListFilename)
+            download_psl(PublicSuffixListFilename)
             utime(PublicSuffixListFilename, None)  # Set mtime to now
         else:
             psl_age = datetime.now() - datetime.fromtimestamp(
                 stat(PublicSuffixListFilename).st_mtime
             )
             if psl_age > timedelta(hours=24):
-                updatePSL(PublicSuffixListFilename)
+                download_psl(PublicSuffixListFilename)
                 utime(PublicSuffixListFilename, None)  # Set mtime to now
 
     with open(PublicSuffixListFilename, encoding="utf-8") as psl_file:

@@ -242,9 +242,17 @@ request from being abused, `trustymail`:
   (including the cloud metadata address `169.254.169.254`), and other
   reserved addresses.  This blocks server-side request forgery (SSRF)
   via a hostile or misconfigured record;
+- pins the connection to the address that was validated, so the host
+  cannot be rebound to an internal address between validation and
+  connection.  The original hostname is still used for the TLS SNI and
+  certificate check, so certificate verification is unaffected;
 - requires valid TLS and does not follow redirects, per RFC 8461; and
 - streams the response and caps it at 64&nbsp;KiB so an oversized body
   or a decompression bomb cannot exhaust memory.
+
+These same protections (implemented in the `trustymail.safe_fetch`
+module) are applied to the public suffix list download, which is
+size-capped and fetched over validated, pinned, verified TLS.
 
 ### SMTP TLS Reporting (TLS-RPT) ###
 

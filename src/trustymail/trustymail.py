@@ -6,7 +6,6 @@ from collections import OrderedDict
 import csv
 import datetime
 import inspect
-import ipaddress
 import json
 import logging
 import re
@@ -20,6 +19,7 @@ import dns.reversename
 import requests
 import spf
 
+from . import safe_fetch
 from .domain import Domain, get_public_suffix
 
 # A cache for SMTP scanning results
@@ -796,111 +796,6 @@ MTA_STS_MAX_AGE_LIMIT = 31557600
 MTA_STS_POLICY_MAX_BYTES = 64 * 1024
 
 
-class MtaStsFetchError(Exception):
-    """Raised when an MTA-STS policy cannot be safely fetched."""
-
-
-def _is_public_ip(ip):
-    """Return whether an address is globally routable and safe to fetch from.
-
-    Loopback, private, link-local (which includes the cloud metadata
-    address 169.254.169.254), reserved, multicast, and unspecified
-    addresses are all rejected.  IPv4-mapped IPv6 addresses are unwrapped
-    so the embedded IPv4 address is what gets evaluated.
-    """
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
-
-
-def validate_mta_sts_host(hostname):
-    """Confirm an MTA-STS policy host resolves only to public addresses.
-
-    This guards the MTA-STS policy fetch against server-side request
-    forgery (SSRF).  The host name is derived from the scanned domain's
-    own DNS, so without this check a domain could point its ``mta-sts``
-    host at a loopback, private, or link-local address (such as a cloud
-    metadata endpoint) and induce trustymail to issue requests against
-    internal services.
-
-    Parameters
-    ----------
-    hostname : str
-        The MTA-STS policy host (``mta-sts.<domain>``) to validate.
-
-    Returns
-    -------
-    list of str
-        The validated, publicly routable IP addresses for the host.
-
-    Raises
-    ------
-    MtaStsFetchError
-        If the host does not resolve, resolves to no addresses, or
-        resolves to any non-public address.
-
-    Notes
-    -----
-    Validation happens before the request is issued.  Because
-    ``requests`` re-resolves the host when it connects, a determined
-    attacker controlling the authoritative DNS could still rebind the
-    name to an internal address in the window between this check and the
-    connection.  Closing that window entirely would require pinning the
-    connection to a validated address; this check blocks the common case
-    of a statically misconfigured or hostile record.
-    """
-    try:
-        addrinfo = socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as error:
-        raise MtaStsFetchError(f"could not resolve {hostname}: {error}")
-
-    addresses = []
-    for _family, _type, _proto, _canonname, sockaddr in addrinfo:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if not _is_public_ip(ip):
-            raise MtaStsFetchError(f"{hostname} resolves to non-public address {ip}")
-        addresses.append(str(ip))
-
-    if not addresses:
-        raise MtaStsFetchError(f"{hostname} did not resolve to any address")
-
-    return addresses
-
-
-def _read_mta_sts_body(response):
-    """Read an MTA-STS policy body, enforcing a maximum size.
-
-    The body is streamed and the accumulated (decoded) size is capped at
-    ``MTA_STS_POLICY_MAX_BYTES`` so that an oversized response or a
-    decompression bomb cannot exhaust memory.
-
-    Raises
-    ------
-    MtaStsFetchError
-        If the body exceeds the maximum allowed size.
-    """
-    chunks = []
-    total = 0
-    for chunk in response.iter_content(chunk_size=4096):
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > MTA_STS_POLICY_MAX_BYTES:
-            raise MtaStsFetchError(
-                "MTA-STS policy exceeds the maximum allowed size of "
-                f"{MTA_STS_POLICY_MAX_BYTES} bytes"
-            )
-        chunks.append(chunk)
-    return b"".join(chunks).decode("utf-8", errors="replace")
-
-
 def parse_semicolon_tags(record_text):
     """Parse a semicolon-delimited ``tag=value`` DNS record into a dictionary.
 
@@ -945,49 +840,31 @@ def fetch_mta_sts_policy(domain, timeout):
     policy_host = "mta-sts.%s" % domain.domain_name
     policy_url = "https://%s/.well-known/mta-sts.txt" % policy_host
 
-    # Confirm the policy host is publicly routable before connecting, so a
-    # hostile or misconfigured domain cannot point us at an internal
-    # address (SSRF).
+    # The policy host is derived from the scanned domain's own DNS, so the
+    # fetch is hardened against SSRF: the host is validated to be publicly
+    # routable, the connection is pinned to that validated address, TLS is
+    # verified, redirects are refused (per RFC 8461 section 3.3), and the
+    # body is size-capped.  See the safe_fetch module for details.
     try:
-        validate_mta_sts_host(policy_host)
-    except MtaStsFetchError as error:
-        handle_error("[MTA-STS]", domain, f"Unable to retrieve MTA-STS policy: {error}")
-        domain.valid_mta_sts = False
-        return
-
-    try:
-        # Per RFC 8461 section 3.3 the policy must be served over valid
-        # HTTPS; redirects are not permitted and so are not followed, and
-        # TLS certificate verification is required.  The body is streamed
-        # so it can be size-capped as it is read.
-        response = requests.get(
-            policy_url,
-            timeout=timeout,
-            allow_redirects=False,
-            stream=True,
-            verify=True,
+        policy_text = safe_fetch.fetch_text(
+            policy_url, timeout, MTA_STS_POLICY_MAX_BYTES
         )
-    except requests.RequestException as error:
+    except (safe_fetch.HostNotPublicError, requests.RequestException) as error:
         handle_error("[MTA-STS]", domain, f"Unable to retrieve MTA-STS policy: {error}")
         domain.valid_mta_sts = False
         return
-
-    with response:
-        if response.status_code != 200:
-            handle_syntax_error(
-                "[MTA-STS]",
-                domain,
-                f"MTA-STS policy request returned HTTP {response.status_code}",
-            )
-            domain.valid_mta_sts = False
-            return
-
-        try:
-            policy_text = _read_mta_sts_body(response)
-        except MtaStsFetchError as error:
-            handle_syntax_error("[MTA-STS]", domain, str(error))
-            domain.valid_mta_sts = False
-            return
+    except safe_fetch.HTTPStatusError as error:
+        handle_syntax_error(
+            "[MTA-STS]",
+            domain,
+            f"MTA-STS policy request returned HTTP {error.status_code}",
+        )
+        domain.valid_mta_sts = False
+        return
+    except safe_fetch.ResponseTooLargeError as error:
+        handle_syntax_error("[MTA-STS]", domain, str(error))
+        domain.valid_mta_sts = False
+        return
 
     domain.mta_sts_policy = policy_text
 
